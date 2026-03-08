@@ -38,11 +38,18 @@ GAZE_SWAP_XY = False
 # -----------------------------------------------------------------------------
 # Calibration
 # -----------------------------------------------------------------------------
-CALIBRATION_POINTS = 9  # 3x3 grid
+CALIBRATION_POINTS = 16  # 4x4 grid (like Gaze Pointer)
 # How close to screen edges the outer dots are (0.05 = 5% inset so corners are calibrated, not extrapolated)
 CALIBRATION_GRID_MARGIN = 0.05  # Outer points at 5% and 95%; center at 50%. Covers full screen.
+# Smooth movement: dot travels from one point to the next so eyes can follow (no jump)
+CALIBRATION_DOT_TRANSITION_SEC = 1.2  # Time for dot to move between points
 CALIBRATION_SAMPLES_PER_POINT = 28   # More samples = more stable fit; center uses these for "neutral"
-CALIBRATION_POINT_DURATION_MS = 1500  # Time to look at each point
+CALIBRATION_POINT_DURATION_MS = 1500  # Time to look at each point once arrived
+# Head-movement calibration (after 16 points): right→center, left→center, down→center, up→center
+HEAD_CALIBRATION_GUIDE_DURATION_SEC = 2.0   # Time to show arrow/smooth guide before dot appears
+HEAD_CALIBRATION_SAMPLES_PER_POSITION = 20  # Samples at edge and at center per direction
+HEAD_CALIBRATION_POSITION_DURATION_MS = 1200  # How long to hold at each position (edge or center)
+HEAD_CALIBRATION_DOT_TRANSITION_SEC = 1.0   # Smooth move from edge to center
 # Fine-tune cursor after calibration (pixels): if center is still off, nudge without re-calibrating
 CALIBRATION_OFFSET_PX_X = 0
 CALIBRATION_OFFSET_PX_Y = 0
@@ -50,10 +57,15 @@ CALIBRATION_OFFSET_PX_Y = 0
 # -----------------------------------------------------------------------------
 # Button UI layout (labels and relative positions for a grid)
 # -----------------------------------------------------------------------------
-BUTTON_LABELS = ["YES", "NO", "HELP", "WATER", "FOOD"]
-# Layout: 2 rows. Row 0: YES, NO; Row 1: HELP, WATER, FOOD
+# Last button is recalibrate: drawn as circle with + (same shape as calibration target)
+BUTTON_LABELS = ["YES", "NO", "HELP", "WATER", "FOOD", "RECAL"]
+# Layout: 3 cols x 2 rows = 6 (RECAL is bottom-right)
 BUTTON_GRID_COLS = 3
 BUTTON_GRID_ROWS = 2
+# Recalibrate button: same label as in BUTTON_LABELS; drawn as circle with + (calibration target shape)
+RECALIBRATE_BUTTON_LABEL = "RECAL"
+# Dwell time on recalibrate button (seconds) to trigger recalibration
+DWELL_RECALIBRATE_SEC = 1.5
 
 # Button appearance
 BUTTON_PADDING_FRACTION = 0.08  # Padding as fraction of button size
@@ -62,6 +74,14 @@ BUTTON_THICKNESS = 3
 BUTTON_COLOR_NORMAL = (70, 70, 70)       # BGR dark gray
 BUTTON_COLOR_HIGHLIGHT = (50, 200, 255)  # BGR orange
 BUTTON_TEXT_COLOR = (255, 255, 255)
+
+# -----------------------------------------------------------------------------
+# Calibration UI (light grey background, target = circle with + in dark green)
+# -----------------------------------------------------------------------------
+CALIBRATION_BG_COLOR = (200, 200, 200)   # BGR light grey
+CALIBRATION_TARGET_COLOR = (0, 100, 0)    # BGR dark green (circle + plus)
+CALIBRATION_TARGET_RADIUS = 56            # Circle radius for calibration target
+CALIBRATION_TEXT_COLOR = (40, 40, 40)     # BGR dark grey text on light background
 
 # -----------------------------------------------------------------------------
 # Cursor / gaze dot (nicer look: ring + inner dot)
