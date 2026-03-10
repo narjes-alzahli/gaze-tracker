@@ -213,22 +213,96 @@ def gaze_to_screen_no_calibration(gaze_norm_x, gaze_norm_y, screen_width, screen
 
 
 # -----------------------------------------------------------------------------
+# Blink detection (Eye Aspect Ratio)
+# -----------------------------------------------------------------------------
+# MediaPipe Face Mesh indices for EAR (6 points per eye: outer, inner, upper x2, lower x2)
+_EAR_LEFT = (33, 133, 160, 158, 153, 144)   # outer, inner, upper, upper-mid, lower-mid, lower
+_EAR_RIGHT = (263, 362, 387, 385, 380, 374)
+
+
+def _dist(a, b):
+    """Euclidean distance between two landmarks (normalized x,y)."""
+    return np.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
+
+
+def compute_ear(landmarks):
+    """
+    Eye Aspect Ratio for left and right eye. Lower = more closed.
+    Returns (ear_left, ear_right) or (None, None) if landmarks invalid.
+    """
+    if landmarks is None or len(landmarks) < 400:
+        return None, None
+    try:
+        # EAR = (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
+        def ear_one(pts):
+            p1, p4, p2, p3, p5, p6 = [landmarks[i] for i in pts]
+            vert1 = _dist(p2, p6)
+            vert2 = _dist(p3, p5)
+            horiz = _dist(p1, p4)
+            if horiz < 1e-6:
+                return None
+            return (vert1 + vert2) / (2.0 * horiz)
+        ear_l = ear_one(_EAR_LEFT)
+        ear_r = ear_one(_EAR_RIGHT)
+        return ear_l, ear_r
+    except (IndexError, KeyError):
+        return None, None
+
+
+class BlinkDetector:
+    """Detects blink end (eyes were closed, now open) and reports so UI can show a message."""
+
+    def __init__(self, ear_threshold=None, closed_frames_min=2):
+        self.ear_threshold = getattr(config, "BLINK_EAR_THRESHOLD", 0.22) if ear_threshold is None else ear_threshold
+        self.closed_frames_min = closed_frames_min
+        self._closed_frames = 0
+        self._was_closed = False
+
+    def update(self, ear_left, ear_right):
+        """
+        Call each frame with current EAR. Returns True when a blink just ended
+        (eyes were closed for at least closed_frames_min and are now open).
+        """
+        if ear_left is None or ear_right is None:
+            return False
+        both_closed = ear_left < self.ear_threshold and ear_right < self.ear_threshold
+        if both_closed:
+            self._closed_frames += 1
+            self._was_closed = True
+            return False
+        # Eyes open (or at least one open)
+        if self._was_closed and self._closed_frames >= self.closed_frames_min:
+            self._was_closed = False
+            self._closed_frames = 0
+            return True
+        self._was_closed = False
+        self._closed_frames = 0
+        return False
+
+
+# -----------------------------------------------------------------------------
 # Gaze smoothing
 # -----------------------------------------------------------------------------
 
 
 class GazeSmoother:
-    """Exponential moving average smoothing for gaze (x, y) to reduce jitter."""
+    """Exponential moving average for gaze (x, y) with optional per-frame step cap to reduce jitter and outlier jumps."""
 
-    def __init__(self, alpha=config.SMOOTHING_ALPHA):
+    def __init__(self, alpha=config.SMOOTHING_ALPHA, max_step=None):
         self.alpha = alpha
+        self.max_step = getattr(config, "SMOOTHING_MAX_STEP", None) if max_step is None else max_step
         self._x = None
         self._y = None
 
     def update(self, x, y):
+        x, y = float(x), float(y)
         if self._x is None:
-            self._x, self._y = float(x), float(y)
+            self._x, self._y = x, y
             return self._x, self._y
+        if self.max_step is not None and self.max_step > 0:
+            dx = np.clip(x - self._x, -self.max_step, self.max_step)
+            dy = np.clip(y - self._y, -self.max_step, self.max_step)
+            x, y = self._x + dx, self._y + dy
         self._x = self.alpha * x + (1 - self.alpha) * self._x
         self._y = self.alpha * y + (1 - self.alpha) * self._y
         return self._x, self._y
@@ -295,6 +369,8 @@ class CalibrationMapper:
         self._matrix = None  # 2x3 affine or None
         self._neutral = None  # (nx, ny) average gaze when looking at center
         self._head_samples = []  # list of {gaze, screen, head_yaw, head_pitch} for head calib
+        self._head_neutral = None  # (yaw, pitch) when looking at center
+        self._head_gain = None  # (gain_x, gain_y) to correct gaze from head movement
 
     def add_sample(self, gaze_x, gaze_y, screen_x, screen_y):
         self._gaze_points.append([gaze_x, gaze_y])
@@ -345,13 +421,52 @@ class CalibrationMapper:
         if self._matrix is None:
             self._neutral = None
             return False
+        # Head-pose correction: from head-movement phase we have center samples (every 2nd group of 20)
+        self._head_neutral = None
+        self._head_gain = None
+        if getattr(config, "USE_HEAD_POSE_CORRECTION", False) and len(self._head_samples) >= 40:
+            # Center groups: indices 20-39, 60-79, 100-119, 140-159 (after right->center, left->center, etc.)
+            center_ranges = [(20, 40), (60, 80), (100, 120), (140, 160)]
+            hy_list = []
+            hp_list = []
+            for start, end in center_ranges:
+                if end <= len(self._head_samples):
+                    for h in self._head_samples[start:end]:
+                        hy_list.append(h["head_yaw"])
+                        hp_list.append(h["head_pitch"])
+            if hy_list:
+                n_yaw = float(np.median(hy_list))
+                n_pitch = float(np.median(hp_list))
+                self._head_neutral = (n_yaw, n_pitch)
+                nx, ny = self._neutral
+                gains_x = []
+                gains_y = []
+                for h in self._head_samples:
+                    hy, hp = h["head_yaw"], h["head_pitch"]
+                    gx, gy = h["gaze"][0], h["gaze"][1]
+                    dyaw = hy - n_yaw
+                    dpitch = hp - n_pitch
+                    if abs(dyaw) > 0.02:
+                        gains_x.append((gx - nx) / dyaw)
+                    if abs(dpitch) > 0.02:
+                        gains_y.append((gy - ny) / dpitch)
+                self._head_gain = (
+                    float(np.median(gains_x)) if gains_x else 0.0,
+                    float(np.median(gains_y)) if gains_y else 0.0,
+                )
         return True
 
-    def map_to_screen(self, gaze_x, gaze_y):
-        """Map normalized gaze to (screen_x, screen_y). Uses neutral so center gaze -> screen center."""
+    def map_to_screen(self, gaze_x, gaze_y, head_yaw=None, head_pitch=None):
+        """Map normalized gaze to (screen_x, screen_y). Uses neutral so center gaze -> screen center. Optional head pose corrects for head movement."""
         if self._matrix is None:
             w, h = pyautogui.size()
             return int(gaze_x * w), int(gaze_y * h)
+        # Optional head-pose correction: shift gaze so cursor doesn't drift when head turns
+        if self._head_neutral is not None and self._head_gain is not None and head_yaw is not None and head_pitch is not None:
+            n_yaw, n_pitch = self._head_neutral
+            gx_gain, gy_gain = self._head_gain
+            gaze_x = gaze_x - gx_gain * (head_yaw - n_yaw)
+            gaze_y = gaze_y - gy_gain * (head_pitch - n_pitch)
         # Apply center correction: raw gaze -> center-neutralized (so neutral -> 0.5, 0.5)
         if self._neutral is not None:
             nx, ny = self._neutral
@@ -368,6 +483,8 @@ class CalibrationMapper:
             "matrix": self._matrix.tolist() if self._matrix is not None else None,
             "neutral": list(self._neutral) if self._neutral is not None else None,
             "head_samples": self._head_samples,
+            "head_neutral": list(self._head_neutral) if self._head_neutral is not None else None,
+            "head_gain": list(self._head_gain) if self._head_gain is not None else None,
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
@@ -389,6 +506,10 @@ class CalibrationMapper:
             self._matrix = None
         n = data.get("neutral")
         self._neutral = tuple(n) if n and len(n) == 2 else None
+        hn = data.get("head_neutral")
+        self._head_neutral = tuple(hn) if hn and len(hn) == 2 else None
+        hg = data.get("head_gain")
+        self._head_gain = tuple(hg) if hg and len(hg) == 2 else None
         return True
 
     def reset(self):
@@ -397,6 +518,8 @@ class CalibrationMapper:
         self._head_samples = []
         self._matrix = None
         self._neutral = None
+        self._head_neutral = None
+        self._head_gain = None
 
 
 # -----------------------------------------------------------------------------
@@ -447,15 +570,95 @@ def draw_face_mesh_overlay(frame, landmarks, width, height):
     return frame
 
 
+def draw_gaze_vectors(frame, landmarks, width, height, gaze_screen_x, gaze_screen_y, screen_width, screen_height):
+    """Draw short vectors from each pupil (iris) toward the gaze point."""
+    if landmarks is None or len(landmarks) <= config.RIGHT_IRIS_INDEX:
+        return frame
+    gx = gaze_screen_x / screen_width * width
+    gy = gaze_screen_y / screen_height * height
+    length = getattr(config, "GAZE_VECTOR_LENGTH_PX", 45)
+    color = (0, 200, 255)  # BGR
+    thickness = 2
+    for idx in (config.LEFT_IRIS_INDEX, config.RIGHT_IRIS_INDEX):
+        if idx < len(landmarks):
+            ex, ey = landmarks[idx].x * width, landmarks[idx].y * height
+            dx = gx - ex
+            dy = gy - ey
+            norm = np.sqrt(dx * dx + dy * dy)
+            if norm > 1e-6:
+                dx, dy = dx / norm, dy / norm
+                end_x = int(ex + dx * length)
+                end_y = int(ey + dy * length)
+                cv2.arrowedLine(frame, (int(ex), int(ey)), (np.clip(end_x, 0, width - 1), np.clip(end_y, 0, height - 1)), color, thickness, tipLength=0.2)
+    return frame
+
+
 # -----------------------------------------------------------------------------
-# Button UI and highlight logic
+# Button UI: layout around center camera panel (display coords)
 # -----------------------------------------------------------------------------
+
+
+def get_ui_layout():
+    """Return (display_w, display_h, camera_rect, button_rects). All in display coords.
+    Choice buttons (A–H) surround the camera: top/bottom are wider, left/right are taller.
+    RECAL is last and drawn as circle.
+    """
+    dw = getattr(config, "UI_DISPLAY_WIDTH", 1280)
+    dh = getattr(config, "UI_DISPLAY_HEIGHT", 720)
+    cw = getattr(config, "UI_CAMERA_PANEL_WIDTH", 480)
+    ch = getattr(config, "UI_CAMERA_PANEL_HEIGHT", 360)
+    margin = 24
+    cx = (dw - cw) // 2
+    cy = (dh - ch) // 2
+    camera_rect = (cx, cy, cw, ch)
+    labels = config.BUTTON_LABELS
+    gap = 16          # gap from camera to buttons
+    gap_between = 32  # gap between the two buttons on same side (top/bottom/left/right)
+    # Top/bottom: wider (horizontal bars)
+    btn_wide = 140
+    btn_short = 64
+    # Left/right: taller (vertical bars)
+    btn_narrow = 64
+    btn_tall = 140
+    recal_size = 72
+    # Top row: 2 wide buttons centered above camera
+    top_y = cy - gap - btn_short
+    top_center_x = cx + cw // 2
+    top_left_x = top_center_x - btn_wide - gap_between // 2
+    top_right_x = top_center_x + gap_between // 2
+    # Bottom row: 2 wide buttons centered below camera
+    bottom_y = cy + ch + gap
+    bottom_center_x = cx + cw // 2
+    bottom_left_x = bottom_center_x - btn_wide - gap_between // 2
+    bottom_right_x = bottom_center_x + gap_between // 2
+    # Left column: 2 tall buttons vertically centered
+    left_x = cx - gap - btn_narrow
+    left_center_y = cy + ch // 2
+    left_top_y = left_center_y - btn_tall - gap_between // 2
+    left_bottom_y = left_center_y + gap_between // 2
+    # Right column: 2 tall buttons vertically centered
+    right_x = cx + cw + gap
+    right_center_y = cy + ch // 2
+    right_top_y = right_center_y - btn_tall - gap_between // 2
+    right_bottom_y = right_center_y + gap_between // 2
+    rects = [
+        (labels[0], (top_left_x, top_y, btn_wide, btn_short)),
+        (labels[1], (top_right_x, top_y, btn_wide, btn_short)),
+        (labels[2], (bottom_left_x, bottom_y, btn_wide, btn_short)),
+        (labels[3], (bottom_right_x, bottom_y, btn_wide, btn_short)),
+        (labels[4], (left_x, left_top_y, btn_narrow, btn_tall)),
+        (labels[5], (left_x, left_bottom_y, btn_narrow, btn_tall)),
+        (labels[6], (right_x, right_top_y, btn_narrow, btn_tall)),
+        (labels[7], (right_x, right_bottom_y, btn_narrow, btn_tall)),
+        (labels[8], (dw - margin - recal_size, dh - margin - recal_size, recal_size, recal_size)),  # RECAL corner
+    ]
+    return dw, dh, camera_rect, rects
 
 
 def build_button_rectangles(frame_width, frame_height):
     """
     Build list of (label, rect) where rect is (x, y, w, h) in frame coordinates.
-    Buttons are drawn in a grid at the bottom of the frame.
+    Used when not using composite layout. For composite UI, use get_ui_layout().
     """
     n = len(config.BUTTON_LABELS)
     cols = config.BUTTON_GRID_COLS
@@ -504,6 +707,75 @@ def hit_test_buttons(screen_x, screen_y, button_rects, frame_width, frame_height
     return None
 
 
+def screen_to_display_point(screen_x, screen_y, display_w, display_h, screen_width, screen_height):
+    """Map screen coords to display (composite) coords."""
+    dx = screen_x / screen_width * display_w
+    dy = screen_y / screen_height * display_h
+    return int(dx), int(dy)
+
+
+def hit_test_buttons_display(screen_x, screen_y, button_rects, display_w, display_h, screen_width, screen_height):
+    """Hit-test buttons when using composite layout (button_rects in display coords)."""
+    dx, dy = screen_to_display_point(screen_x, screen_y, display_w, display_h, screen_width, screen_height)
+    for i, (_, (x, y, w, h)) in enumerate(button_rects):
+        if x <= dx <= x + w and y <= dy <= y + h:
+            return i
+    return None
+
+
+def _on_mouse_recal(event, x, y, flags, param):
+    """Mouse callback: on left-click, if click is on RECAL button (in display coords), request recalibration."""
+    if event != cv2.EVENT_LBUTTONDOWN:
+        return
+    display_w, display_h, screen_width, screen_height, (rx, ry, rw, rh), recal_requested = param
+    if screen_width <= 0 or screen_height <= 0:
+        return
+    dx = x * display_w / screen_width
+    dy = y * display_h / screen_height
+    if rx <= dx <= rx + rw and ry <= dy <= ry + rh:
+        recal_requested[0] = True
+
+
+def draw_composite(composite, camera_frame, camera_rect, button_rects, highlighted_index,
+                   screen_x, screen_y, screen_width, screen_height):
+    """Fill composite with light gray, blit camera in center, draw buttons and gaze cursor. composite modified in place."""
+    dw, dh = composite.shape[1], composite.shape[0]
+    composite[:] = getattr(config, "UI_BG_COLOR", (200, 200, 200))
+    cx, cy, cw, ch = camera_rect
+    cam_resized = cv2.resize(camera_frame, (cw, ch), interpolation=cv2.INTER_LINEAR)
+    composite[cy:cy + ch, cx:cx + cw] = cam_resized
+    recal_label = getattr(config, "RECALIBRATE_BUTTON_LABEL", "RECAL")
+    target_color = getattr(config, "CALIBRATION_TARGET_COLOR", (0, 100, 0))
+    for i, (label, (x, y, w, h)) in enumerate(button_rects):
+        if label == recal_label:
+            cx, cy = x + w // 2, y + h // 2
+            r = min(w, h) // 2 - 8
+            r = max(r, 12)
+            thick = 4 if i == highlighted_index else 3
+            _draw_calibration_target(composite, cx, cy, r, target_color, thick)
+            if i == highlighted_index:
+                cv2.circle(composite, (cx, cy), r + 4, config.BUTTON_COLOR_HIGHLIGHT, 2)
+        else:
+            color = config.BUTTON_COLOR_HIGHLIGHT if i == highlighted_index else config.BUTTON_COLOR_NORMAL
+            cv2.rectangle(composite, (x, y), (x + w, y + h), color, config.BUTTON_THICKNESS)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            (tw, th), _ = cv2.getTextSize(label, font, config.BUTTON_FONT_SCALE, config.BUTTON_THICKNESS)
+            tx = x + (w - tw) // 2
+            ty = y + (h + th) // 2
+            cv2.putText(composite, label, (tx, ty), font, config.BUTTON_FONT_SCALE, config.BUTTON_TEXT_COLOR, config.BUTTON_THICKNESS, cv2.LINE_AA)
+    # Gaze cursor on composite (display coords)
+    dx, dy = screen_to_display_point(screen_x, screen_y, dw, dh, screen_width, screen_height)
+    dx, dy = np.clip(dx, 0, dw - 1), np.clip(dy, 0, dh - 1)
+    r_outer = max(4, config.CURSOR_OUTER_RADIUS * dw // 640)
+    r_inner = max(2, config.CURSOR_INNER_RADIUS * dw // 640)
+    center = (dx, dy)
+    cv2.circle(composite, center, r_outer + 4, config.CURSOR_GLOW_COLOR, 4)
+    cv2.circle(composite, center, r_outer, config.CURSOR_RING_COLOR, 2)
+    cv2.circle(composite, center, r_outer - 2, config.CURSOR_FILL_COLOR, -1)
+    cv2.circle(composite, center, r_inner, config.CURSOR_RING_COLOR, -1)
+    return composite
+
+
 def draw_buttons(frame, button_rects, highlighted_index):
     """Draw button rectangles and labels; recalibrate button is drawn as circle with + (same as calibration target)."""
     recal_label = getattr(config, "RECALIBRATE_BUTTON_LABEL", "RECAL")
@@ -548,11 +820,11 @@ def _draw_calibration_target(img, center_x, center_y, radius, color_bgr, thickne
     cv2.line(img, (cx, cy - arm), (cx, cy + arm), color_bgr, thickness)
 
 
-def _draw_calibration_screen(screen_width, screen_height, sx, sy, point_label, countdown_sec=None,
-                             draw_x=None, draw_y=None, instruction_text=None):
+def _draw_calibration_screen(screen_width, screen_height, sx, sy, point_label=None, countdown_sec=None,
+                             draw_x=None, draw_y=None, instruction_text=None, show_text=False):
     """
     Calibration frame: light grey background, one target = circle with + in dark green.
-    If draw_x, draw_y are set, draw the target there (for smooth animation); else at (sx, sy).
+    When show_text is False, no text is drawn (clean screen with only the target).
     """
     img = np.zeros((screen_height, screen_width, 3), dtype=np.uint8)
     img[:] = getattr(config, "CALIBRATION_BG_COLOR", (200, 200, 200))
@@ -561,16 +833,48 @@ def _draw_calibration_screen(screen_width, screen_height, sx, sy, point_label, c
     r = getattr(config, "CALIBRATION_TARGET_RADIUS", 56)
     target_color = getattr(config, "CALIBRATION_TARGET_COLOR", (0, 100, 0))
     _draw_calibration_target(img, cx, cy, r, target_color)
-    text_color = getattr(config, "CALIBRATION_TEXT_COLOR", (40, 40, 40))
-    cv2.putText(img, str(point_label), (50, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, text_color, 2, cv2.LINE_AA)
-    if instruction_text:
-        cv2.putText(img, instruction_text, (50, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.9, text_color, 2, cv2.LINE_AA)
-    if countdown_sec is not None and countdown_sec > 0:
-        cv2.putText(img, f"Hold still... {int(countdown_sec)}s", (50, screen_height - 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, text_color, 2, cv2.LINE_AA)
-    cv2.putText(img, "ESC or Q = exit calibration", (50, screen_height - 15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 1, cv2.LINE_AA)
+    if show_text and point_label is not None:
+        text_color = getattr(config, "CALIBRATION_TEXT_COLOR", (40, 40, 40))
+        cv2.putText(img, str(point_label), (50, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, text_color, 2, cv2.LINE_AA)
+        if instruction_text:
+            cv2.putText(img, instruction_text, (50, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.9, text_color, 2, cv2.LINE_AA)
+        if countdown_sec is not None and countdown_sec > 0:
+            cv2.putText(img, f"Hold still... {int(countdown_sec)}s", (50, screen_height - 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, text_color, 2, cv2.LINE_AA)
+        cv2.putText(img, "ESC or Q = exit calibration", (50, screen_height - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 1, cv2.LINE_AA)
     return img
+
+
+def _show_instruction_screen(screen_width, screen_height, window_name, lines, exit_check_fn):
+    """
+    Show a full-screen instruction (same bg as calibration). lines = list of strings.
+    Waits for any key; returns False if user hits ESC/Q (exit), True to continue.
+    No gaze or face data is collected here so calibration logic stays correct.
+    """
+    img = np.zeros((screen_height, screen_width, 3), dtype=np.uint8)
+    img[:] = getattr(config, "CALIBRATION_BG_COLOR", (200, 200, 200))
+    text_color = getattr(config, "CALIBRATION_TEXT_COLOR", (40, 40, 40))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale_title = 1.2
+    scale_body = 0.9
+    y = 120
+    for i, line in enumerate(lines):
+        if not line.strip():
+            y += 28
+            continue
+        scale = scale_title if i == 0 else scale_body
+        (tw, th), _ = cv2.getTextSize(line, font, scale, 2)
+        x = (screen_width - tw) // 2
+        cv2.putText(img, line, (x, y), font, scale, text_color, 2, cv2.LINE_AA)
+        y += int(th * 1.3)
+    prompt = "Press any key to continue"
+    (pw, ph), _ = cv2.getTextSize(prompt, font, 0.9, 2)
+    cv2.putText(img, prompt, ((screen_width - pw) // 2, screen_height - 60), font, 0.9, text_color, 2, cv2.LINE_AA)
+    cv2.putText(img, "ESC or Q = exit", ((screen_width - 180) // 2, screen_height - 20), font, 0.6, text_color, 1, cv2.LINE_AA)
+    cv2.imshow(window_name, img)
+    key = cv2.waitKey(0) & 0xFF
+    return not exit_check_fn(key)
 
 
 def _animate_dot_to_target(screen_width, screen_height, start_xy, end_xy, duration_sec,
@@ -588,8 +892,8 @@ def _animate_dot_to_target(screen_width, screen_height, start_xy, end_xy, durati
         x = start_xy[0] + t * (end_xy[0] - start_xy[0])
         y = start_xy[1] + t * (end_xy[1] - start_xy[1])
         cal_img = _draw_calibration_screen(
-            screen_width, screen_height, end_xy[0], end_xy[1], point_label,
-            draw_x=x, draw_y=y, instruction_text=instruction_text,
+            screen_width, screen_height, end_xy[0], end_xy[1],
+            draw_x=x, draw_y=y, show_text=False,
         )
         cv2.imshow(window_name, cal_img)
         if exit_check_fn(cv2.waitKey(wait_ms) & 0xFF):
@@ -612,8 +916,7 @@ def _collect_samples_at_point(camera, detector, smoother, mapper, screen_width, 
             frame = cv2.flip(frame, 1)
         if not ok or frame is None:
             cal_img = _draw_calibration_screen(
-                screen_width, screen_height, sx, sy, point_label,
-                countdown_sec=max(0, duration_sec - (time.perf_counter() - t0)),
+                screen_width, screen_height, sx, sy, show_text=False,
             )
             cv2.imshow(window_name, cal_img)
             if exit_check_fn(cv2.waitKey(1) & 0xFF):
@@ -627,8 +930,7 @@ def _collect_samples_at_point(camera, detector, smoother, mapper, screen_width, 
             add_sample_fn(mapper, gx, gy, sx, sy, landmarks)
             collected += 1
         cal_img = _draw_calibration_screen(
-            screen_width, screen_height, sx, sy, point_label,
-            countdown_sec=max(0, duration_sec - (time.perf_counter() - t0)),
+            screen_width, screen_height, sx, sy, show_text=False,
         )
         cv2.imshow(window_name, cal_img)
         if exit_check_fn(cv2.waitKey(1) & 0xFF):
@@ -641,8 +943,10 @@ def run_head_calibration(camera, detector, smoother, mapper, screen_width, scree
     """
     After 16-point calibration: guide user to turn head right→center, left→center, down→center, up→center.
     Smooth animated dot leads the eyes; we collect gaze+head samples at edge and center per direction.
+    Instruction was already shown before this phase; here we only show the dot (no text).
     Uses the existing window (window_name).
     """
+    smoother.reset()  # Clean state for head phase so first samples are not contaminated
     center_x = screen_width // 2
     center_y = screen_height // 2
     margin = getattr(config, "CALIBRATION_GRID_MARGIN", 0.05)
@@ -702,6 +1006,7 @@ def run_calibration(camera, detector, smoother, screen_width, screen_height, fra
     """
     Run 16-point calibration with smooth dot movement between points (eyes follow the dot).
     Then run head-movement calibration: right→center, left→center, down→center, up→center.
+    Instructions are shown once before each section; during calibration only the dot is shown.
     Uses the existing window (window_name); does not create or destroy windows.
     Returns a CalibrationMapper with computed transform.
     """
@@ -711,6 +1016,16 @@ def run_calibration(camera, detector, smoother, screen_width, screen_height, fra
     duration = config.CALIBRATION_POINT_DURATION_MS / 1000.0
     samples_per_point = getattr(config, "CALIBRATION_SAMPLES_PER_POINT", 20)
     transition_sec = getattr(config, "CALIBRATION_DOT_TRANSITION_SEC", 1.2)
+
+    # Section 1: Look at the dot (16 points). Show instructions first; no gaze collected here.
+    instructions_look = getattr(config, "CALIBRATION_INSTRUCTIONS_LOOK_AT_DOT", [
+        "Look at the dot", "A dot will move to 16 points.",
+        "Look at the dot and hold still at each position.", "", "Press any key to start.",
+    ])
+    if not _show_instruction_screen(screen_width, screen_height, window_name, instructions_look, _is_exit_key):
+        mapper.compute()
+        return mapper
+    smoother.reset()  # Clean state before collecting so first point is not contaminated
 
     # Start at first point (no transition for point 0)
     current_xy = (points[0][0], points[0][1])
@@ -741,7 +1056,16 @@ def run_calibration(camera, detector, smoother, screen_width, screen_height, fra
             mapper.compute()
             return mapper
 
-    # Head-movement phase
+    # Section 2: Move head. Show instructions first; then run head phase (no text during).
+    instructions_head = getattr(config, "CALIBRATION_INSTRUCTIONS_MOVE_HEAD", [
+        "Move your head",
+        "Follow the dot: turn your head right, then center; left, then center; down, then center; up, then center.",
+        "", "Press any key to start.",
+    ])
+    if not _show_instruction_screen(screen_width, screen_height, window_name, instructions_head, _is_exit_key):
+        mapper.compute()
+        return mapper
+
     if not run_head_calibration(camera, detector, smoother, mapper, screen_width, screen_height,
                                frame_width, frame_height, window_name):
         mapper.compute()
@@ -786,12 +1110,21 @@ def main():
     else:
         cal_mapper.load(cal_path)
 
-    # Button layout (in frame coords); last button is recalibrate (circle with +)
-    button_rects = build_button_rectangles(frame_width, frame_height)
-    recalibrate_button_index = len(button_rects) - 1  # RECAL is last
+    # Layout: camera in center (smaller), buttons around it, light gray background
+    display_w, display_h, camera_rect, button_rects = get_ui_layout()
+    recalibrate_button_index = len(button_rects) - 1
+    recal_rect = button_rects[recalibrate_button_index][1]  # (x, y, w, h) in display coords
+    recal_click_requested = [False]
+    cv2.setMouseCallback(window_name, _on_mouse_recal,
+                         (display_w, display_h, screen_width, screen_height, recal_rect, recal_click_requested))
     dwell_recal_sec = getattr(config, "DWELL_RECALIBRATE_SEC", 1.5)
     dwell_accumulator = 0.0
     last_frame_time = time.perf_counter()
+    composite = np.zeros((display_h, display_w, 3), dtype=np.uint8)
+    blink_detector = BlinkDetector(
+        closed_frames_min=getattr(config, "BLINK_CLOSED_FRAMES_MIN", 2),
+    )
+    blink_message_until = 0.0
 
     try:
         while True:
@@ -804,28 +1137,28 @@ def main():
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             landmarks = detector.process(frame_rgb)
 
-            # Gaze: normalized -> smooth -> screen
+            ear_left, ear_right = compute_ear(landmarks)
+            if blink_detector.update(ear_left, ear_right):
+                blink_message_until = time.perf_counter() + getattr(config, "BLINK_MESSAGE_DURATION_SEC", 2.0)
+
             gaze_norm = estimate_gaze_normalized(landmarks, frame_width, frame_height)
+            head_yaw, head_pitch = estimate_head_pose(landmarks) if landmarks else (None, None)
             if gaze_norm is not None:
                 smooth_x, smooth_y = smoother.update(gaze_norm[0], gaze_norm[1])
-                screen_x, screen_y = cal_mapper.map_to_screen(smooth_x, smooth_y)
+                screen_x, screen_y = cal_mapper.map_to_screen(smooth_x, smooth_y, head_yaw=head_yaw, head_pitch=head_pitch)
                 screen_x += getattr(config, "CALIBRATION_OFFSET_PX_X", 0)
                 screen_y += getattr(config, "CALIBRATION_OFFSET_PX_Y", 0)
-                screen_x = np.clip(screen_x, 0, screen_width - 1)
-                screen_y = np.clip(screen_y, 0, screen_height - 1)
+                screen_x = int(np.clip(screen_x, 0, screen_width - 1))
+                screen_y = int(np.clip(screen_y, 0, screen_height - 1))
             else:
-                screen_x = screen_width // 2
-                screen_y = screen_height // 2
+                screen_x, screen_y = screen_width // 2, screen_height // 2
                 smoother.reset()
 
-            # Overlay: face mesh key points
+            # On camera frame: face mesh + short gaze vectors (no cursor here; cursor on composite)
             draw_face_mesh_overlay(frame, landmarks, frame_width, frame_height)
+            draw_gaze_vectors(frame, landmarks, frame_width, frame_height, screen_x, screen_y, screen_width, screen_height)
 
-            # Cursor at gaze position
-            draw_gaze_cursor(frame, screen_x, screen_y, frame_width, frame_height, screen_width, screen_height)
-
-            # Buttons and highlight; dwell on recalibrate button triggers recalibration
-            highlighted = hit_test_buttons(screen_x, screen_y, button_rects, frame_width, frame_height, screen_width, screen_height)
+            highlighted = hit_test_buttons_display(screen_x, screen_y, button_rects, display_w, display_h, screen_width, screen_height)
             now = time.perf_counter()
             dt = now - last_frame_time
             last_frame_time = now
@@ -840,10 +1173,27 @@ def main():
             else:
                 dwell_accumulator = 0.0
 
-            draw_buttons(frame, button_rects, highlighted)
+            if recal_click_requested[0]:
+                recal_click_requested[0] = False
+                cal_mapper = run_calibration(camera, detector, smoother, screen_width, screen_height,
+                                             frame_width, frame_height, window_name)
+                if cal_mapper._matrix is not None:
+                    cal_mapper.save(cal_path)
 
-            # Fullscreen: scale frame to screen size
-            frame_display = cv2.resize(frame, (screen_width, screen_height), interpolation=cv2.INTER_LINEAR)
+            draw_composite(composite, frame, camera_rect, button_rects, highlighted,
+                          screen_x, screen_y, screen_width, screen_height)
+            if now < blink_message_until:
+                dw, dh = composite.shape[1], composite.shape[0]
+                msg = "Blinking"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                scale = 1.4
+                thickness = 3
+                (tw, th), _ = cv2.getTextSize(msg, font, scale, thickness)
+                tx = (dw - tw) // 2
+                ty = 56
+                cv2.putText(composite, msg, (tx, ty), font, scale, (0, 0, 120), thickness + 2, cv2.LINE_AA)
+                cv2.putText(composite, msg, (tx, ty), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+            frame_display = cv2.resize(composite, (screen_width, screen_height), interpolation=cv2.INTER_LINEAR)
             cv2.imshow(window_name, frame_display)
             key = cv2.waitKey(1) & 0xFF
             if _is_exit_key(key):
