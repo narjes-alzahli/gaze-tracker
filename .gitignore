@@ -12,6 +12,7 @@ __pycache__/
 
 # Local calibration (user-specific)
 calibration.json
+eyegestures_calibration.pkl
 
 # IDE
 .idea/

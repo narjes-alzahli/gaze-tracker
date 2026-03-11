@@ -20,6 +20,14 @@ import time
 
 import config
 
+# Optional: EyeGestures ML-based gaze (only used when config.USE_EYEGESTURES is True)
+try:
+    from eyeGestures import EyeGestures_v3
+    _EYEGESTURES_AVAILABLE = True
+except ImportError:
+    EyeGestures_v3 = None
+    _EYEGESTURES_AVAILABLE = False
+
 # Disable PyAutoGUI fail-safe for this app (we only use it for screen size)
 pyautogui.FAILSAFE = False
 
@@ -203,13 +211,6 @@ def estimate_gaze_normalized(landmarks, width, height):
     if getattr(config, "GAZE_SWAP_XY", False):
         gaze_x, gaze_y = gaze_y, gaze_x
     return gaze_x, gaze_y
-
-
-def gaze_to_screen_no_calibration(gaze_norm_x, gaze_norm_y, screen_width, screen_height):
-    """Map normalized gaze [0,1] to screen coordinates (no calibration)."""
-    x = int(gaze_norm_x * screen_width)
-    y = int(gaze_norm_y * screen_height)
-    return x, y
 
 
 # -----------------------------------------------------------------------------
@@ -655,58 +656,6 @@ def get_ui_layout():
     return dw, dh, camera_rect, rects
 
 
-def build_button_rectangles(frame_width, frame_height):
-    """
-    Build list of (label, rect) where rect is (x, y, w, h) in frame coordinates.
-    Used when not using composite layout. For composite UI, use get_ui_layout().
-    """
-    n = len(config.BUTTON_LABELS)
-    cols = config.BUTTON_GRID_COLS
-    rows = config.BUTTON_GRID_ROWS
-    pad_frac = config.BUTTON_PADDING_FRACTION
-    # Use bottom portion of frame for buttons
-    ui_height = int(frame_height * 0.35)
-    ui_y0 = frame_height - ui_height
-    cell_w = frame_width // cols
-    cell_h = ui_height // rows
-    padding_w = int(cell_w * pad_frac)
-    padding_h = int(cell_h * pad_frac)
-    rects = []
-    for i, label in enumerate(config.BUTTON_LABELS):
-        row = i // cols
-        col = i % cols
-        x = col * cell_w + padding_w
-        y = ui_y0 + row * cell_h + padding_h
-        w = cell_w - 2 * padding_w
-        h = cell_h - 2 * padding_h
-        rects.append((label, (x, y, w, h)))
-    return rects
-
-
-def screen_to_frame_point(screen_x, screen_y, frame_width, frame_height, screen_width, screen_height):
-    """Map screen gaze position to frame coordinates (for hit-testing buttons drawn on frame)."""
-    # Gaze is reported in screen space; we draw buttons on frame. So we need to map
-    # screen (sx, sy) to frame (fx, fy). Our UI buttons are in frame coords.
-    # We have: gaze_screen = mapping(gaze_norm). So gaze_norm -> screen.
-    # Frame overlay: we draw cursor at frame pos = (gaze_norm * frame_width, gaze_norm * frame_height)
-    # So for hit-test we should use normalized gaze mapped to frame size.
-    fx = screen_x / screen_width * frame_width
-    fy = screen_y / screen_height * frame_height
-    return int(fx), int(fy)
-
-
-def hit_test_buttons(screen_x, screen_y, button_rects, frame_width, frame_height, screen_width, screen_height):
-    """
-    Return the index of the button under (screen_x, screen_y), or None.
-    button_rects from build_button_rectangles are in frame coords.
-    """
-    fx, fy = screen_to_frame_point(screen_x, screen_y, frame_width, frame_height, screen_width, screen_height)
-    for i, (_, (x, y, w, h)) in enumerate(button_rects):
-        if x <= fx <= x + w and y <= fy <= y + h:
-            return i
-    return None
-
-
 def screen_to_display_point(screen_x, screen_y, display_w, display_h, screen_width, screen_height):
     """Map screen coords to display (composite) coords."""
     dx = screen_x / screen_width * display_w
@@ -808,16 +757,19 @@ def draw_buttons(frame, button_rects, highlighted_index):
 # Calibration flow: 16-point with smooth dot movement + head-movement phase
 # -----------------------------------------------------------------------------
 
-# Target shape: circle with + inside (dark green on light grey); same shape used for recalibrate button
 def _draw_calibration_target(img, center_x, center_y, radius, color_bgr, thickness=4):
-    """Draw circle with + (cross) inside at (center_x, center_y)."""
+    """Draw filled green target: solid circle + thick black outline and black + lines."""
     cx, cy = int(center_x), int(center_y)
     r = int(radius)
-    cv2.circle(img, (cx, cy), r, color_bgr, thickness)
-    # Plus: horizontal and vertical lines through center
+    # Filled circle in target color
+    cv2.circle(img, (cx, cy), r, color_bgr, -1)
+    # Outer black ring
+    cv2.circle(img, (cx, cy), r, (0, 0, 0), max(thickness, 4))
+    # Plus: horizontal and vertical lines through center in black
     arm = int(r * 0.6)
-    cv2.line(img, (cx - arm, cy), (cx + arm, cy), color_bgr, thickness)
-    cv2.line(img, (cx, cy - arm), (cx, cy + arm), color_bgr, thickness)
+    line_thick = max(thickness, 4)
+    cv2.line(img, (cx - arm, cy), (cx + arm, cy), (0, 0, 0), line_thick)
+    cv2.line(img, (cx, cy - arm), (cx, cy + arm), (0, 0, 0), line_thick)
 
 
 def _draw_calibration_screen(screen_width, screen_height, sx, sy, point_label=None, countdown_sec=None,
@@ -1056,23 +1008,68 @@ def run_calibration(camera, detector, smoother, screen_width, screen_height, fra
             mapper.compute()
             return mapper
 
-    # Section 2: Move head. Show instructions first; then run head phase (no text during).
-    instructions_head = getattr(config, "CALIBRATION_INSTRUCTIONS_MOVE_HEAD", [
-        "Move your head",
-        "Follow the dot: turn your head right, then center; left, then center; down, then center; up, then center.",
-        "", "Press any key to start.",
-    ])
-    if not _show_instruction_screen(screen_width, screen_height, window_name, instructions_head, _is_exit_key):
-        mapper.compute()
-        return mapper
-
-    if not run_head_calibration(camera, detector, smoother, mapper, screen_width, screen_height,
-                               frame_width, frame_height, window_name):
-        mapper.compute()
-        return mapper
+    # Section 2 (optional): Move head for head-pose correction. Skip if RUN_HEAD_CALIBRATION is False.
+    if getattr(config, "RUN_HEAD_CALIBRATION", False):
+        instructions_head = getattr(config, "CALIBRATION_INSTRUCTIONS_MOVE_HEAD", [
+            "Move your head",
+            "Follow the dot: turn your head right, then center; left, then center; down, then center; up, then center.",
+            "", "Press any key to start.",
+        ])
+        if not _show_instruction_screen(screen_width, screen_height, window_name, instructions_head, _is_exit_key):
+            mapper.compute()
+            return mapper
+        if not run_head_calibration(camera, detector, smoother, mapper, screen_width, screen_height,
+                                   frame_width, frame_height, window_name):
+            mapper.compute()
+            return mapper
 
     mapper.compute()
     return mapper
+
+
+def run_calibration_eyegestures(camera, gestures, screen_width, screen_height, window_name):
+    """
+    Run EyeGestures V3 calibration: show dot at current target, collect samples until
+    all 25 points are done (point moves when user looks at dot long enough). Returns True if completed.
+    """
+    context = getattr(config, "EYEGESTURES_CONTEXT", "main")
+    transition_count = 0
+    last_point = None
+    num_points = 25  # EyeGestures CalibrationMatrix default
+    bg_color = getattr(config, "CALIBRATION_BG_COLOR", (200, 200, 200))
+    target_color = getattr(config, "CALIBRATION_TARGET_COLOR", (0, 100, 0))
+    r = getattr(config, "CALIBRATION_TARGET_RADIUS", 56)
+
+    while transition_count < num_points:
+        ok, frame = camera.read()
+        if not ok or frame is None:
+            img = np.zeros((screen_height, screen_width, 3), dtype=np.uint8)
+            img[:] = bg_color
+            cv2.imshow(window_name, img)
+            if _is_exit_key(cv2.waitKey(30) & 0xFF):
+                return False
+            continue
+        # EyeGestures flips frame internally; pass raw BGR
+        event, cevent = gestures.step(frame, True, screen_width, screen_height, context=context)
+        if cevent is None:
+            continue
+        pt = cevent.point
+        if last_point is not None and (abs(pt[0] - last_point[0]) > 5 or abs(pt[1] - last_point[1]) > 5):
+            transition_count += 1
+        last_point = np.array([pt[0], pt[1]])
+
+        img = np.zeros((screen_height, screen_width, 3), dtype=np.uint8)
+        img[:] = bg_color
+        cx, cy = int(pt[0]), int(pt[1])
+        _draw_calibration_target(img, cx, cy, r, target_color)
+        text_color = getattr(config, "CALIBRATION_TEXT_COLOR", (40, 40, 40))
+        cv2.putText(img, f"Point {transition_count + 1}/{num_points}  Look at the dot", (50, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, text_color, 2, cv2.LINE_AA)
+        cv2.putText(img, "ESC or Q = exit", (50, screen_height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 1, cv2.LINE_AA)
+        cv2.imshow(window_name, img)
+        if _is_exit_key(cv2.waitKey(1) & 0xFF):
+            return False
+    return True
 
 
 # -----------------------------------------------------------------------------
@@ -1090,25 +1087,60 @@ def main():
     frame_width = int(camera._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(camera._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Face mesh
-    detector = FaceMeshDetector()
-    smoother = GazeSmoother(alpha=config.SMOOTHING_ALPHA)
+    use_eyegestures = getattr(config, "USE_EYEGESTURES", False) and _EYEGESTURES_AVAILABLE
+    gestures = None
+    if use_eyegestures:
+        try:
+            calibration_radius = getattr(config, "EYEGESTURES_CALIBRATION_RADIUS", 1000)
+            gestures = EyeGestures_v3(calibration_radius=calibration_radius)
+        except Exception:
+            use_eyegestures = False
 
+    # Face mesh (used for blink + overlay in both modes; for gaze only when not EyeGestures)
+    detector = FaceMeshDetector()
+    if not use_eyegestures:
+        smoother = GazeSmoother(alpha=config.SMOOTHING_ALPHA)
+        cal_mapper = CalibrationMapper()
+    else:
+        smoother = None
+        cal_mapper = None
     cal_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")
-    cal_mapper = CalibrationMapper()
+    eg_cal_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eyegestures_calibration.pkl")
+    context = getattr(config, "EYEGESTURES_CONTEXT", "main")
+
     window_name = "Gaze UI - Face mesh + gaze cursor (no auto-click)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     _set_fullscreen(window_name)
     _set_window_on_top(window_name)
 
-    # First time (no calibration file): run calibration immediately in this window, no prompt
-    if not os.path.isfile(cal_path):
-        cal_mapper = run_calibration(camera, detector, smoother, screen_width, screen_height,
-                                     frame_width, frame_height, window_name)
-        if cal_mapper._matrix is not None:
-            cal_mapper.save(cal_path)
+    if use_eyegestures:
+        if os.path.isfile(eg_cal_path):
+            try:
+                with open(eg_cal_path, "rb") as f:
+                    gestures.loadModel(f.read(), context=context)
+            except Exception:
+                if run_calibration_eyegestures(camera, gestures, screen_width, screen_height, window_name):
+                    try:
+                        with open(eg_cal_path, "wb") as f:
+                            f.write(gestures.saveModel(context=context) or b"")
+                    except Exception:
+                        pass
+        else:
+            if run_calibration_eyegestures(camera, gestures, screen_width, screen_height, window_name):
+                try:
+                    with open(eg_cal_path, "wb") as f:
+                        f.write(gestures.saveModel(context=context) or b"")
+                except Exception:
+                    pass
     else:
-        cal_mapper.load(cal_path)
+        # First time (no calibration file): run calibration immediately in this window, no prompt
+        if not os.path.isfile(cal_path):
+            cal_mapper = run_calibration(camera, detector, smoother, screen_width, screen_height,
+                                         frame_width, frame_height, window_name)
+            if cal_mapper._matrix is not None:
+                cal_mapper.save(cal_path)
+        else:
+            cal_mapper.load(cal_path)
 
     # Layout: camera in center (smaller), buttons around it, light gray background
     display_w, display_h, camera_rect, button_rects = get_ui_layout()
@@ -1125,38 +1157,62 @@ def main():
         closed_frames_min=getattr(config, "BLINK_CLOSED_FRAMES_MIN", 2),
     )
     blink_message_until = 0.0
+    last_valid_frame = None  # reuse when camera temporarily fails so we still draw UI
 
     try:
         while True:
             ok, frame = camera.read()
             if not ok or frame is None:
-                continue
-            if config.MIRROR_CAMERA:
-                frame = cv2.flip(frame, 1)
-
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            landmarks = detector.process(frame_rgb)
-
-            ear_left, ear_right = compute_ear(landmarks)
-            if blink_detector.update(ear_left, ear_right):
-                blink_message_until = time.perf_counter() + getattr(config, "BLINK_MESSAGE_DURATION_SEC", 2.0)
-
-            gaze_norm = estimate_gaze_normalized(landmarks, frame_width, frame_height)
-            head_yaw, head_pitch = estimate_head_pose(landmarks) if landmarks else (None, None)
-            if gaze_norm is not None:
-                smooth_x, smooth_y = smoother.update(gaze_norm[0], gaze_norm[1])
-                screen_x, screen_y = cal_mapper.map_to_screen(smooth_x, smooth_y, head_yaw=head_yaw, head_pitch=head_pitch)
-                screen_x += getattr(config, "CALIBRATION_OFFSET_PX_X", 0)
-                screen_y += getattr(config, "CALIBRATION_OFFSET_PX_Y", 0)
-                screen_x = int(np.clip(screen_x, 0, screen_width - 1))
-                screen_y = int(np.clip(screen_y, 0, screen_height - 1))
-            else:
+                # Still draw UI with last frame or placeholder so window isn't stuck gray
+                if last_valid_frame is not None:
+                    frame_display = last_valid_frame
+                else:
+                    frame_display = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
+                    frame_display[:] = getattr(config, "UI_BG_COLOR", (200, 200, 200))
+                    cv2.putText(frame_display, "No camera", (frame_width // 4, frame_height // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (80, 80, 80), 2, cv2.LINE_AA)
+                landmarks = None
                 screen_x, screen_y = screen_width // 2, screen_height // 2
-                smoother.reset()
+                # still do draw_composite and imshow below
+            else:
+                frame_display = cv2.flip(frame, 1) if config.MIRROR_CAMERA else frame
+                last_valid_frame = frame_display.copy()
+                frame_rgb = cv2.cvtColor(frame_display, cv2.COLOR_BGR2RGB)
+                landmarks = detector.process(frame_rgb)
+
+                ear_left, ear_right = compute_ear(landmarks)
+                if blink_detector.update(ear_left, ear_right):
+                    blink_message_until = time.perf_counter() + getattr(config, "BLINK_MESSAGE_DURATION_SEC", 2.0)
+
+                if use_eyegestures:
+                    # EyeGestures expects unflipped BGR; they flip internally. Can throw if no face.
+                    try:
+                        frame_for_eg = frame
+                        event, _cevent = gestures.step(frame_for_eg, False, screen_width, screen_height, context=context)
+                        if event is not None:
+                            screen_x = int(np.clip(event.point[0], 0, screen_width - 1))
+                            screen_y = int(np.clip(event.point[1], 0, screen_height - 1))
+                        else:
+                            screen_x, screen_y = screen_width // 2, screen_height // 2
+                    except Exception:
+                        screen_x, screen_y = screen_width // 2, screen_height // 2
+                else:
+                    gaze_norm = estimate_gaze_normalized(landmarks, frame_width, frame_height)
+                    head_yaw, head_pitch = estimate_head_pose(landmarks) if landmarks else (None, None)
+                    if gaze_norm is not None:
+                        smooth_x, smooth_y = smoother.update(gaze_norm[0], gaze_norm[1])
+                        screen_x, screen_y = cal_mapper.map_to_screen(smooth_x, smooth_y, head_yaw=head_yaw, head_pitch=head_pitch)
+                        screen_x += getattr(config, "CALIBRATION_OFFSET_PX_X", 0)
+                        screen_y += getattr(config, "CALIBRATION_OFFSET_PX_Y", 0)
+                        screen_x = int(np.clip(screen_x, 0, screen_width - 1))
+                        screen_y = int(np.clip(screen_y, 0, screen_height - 1))
+                    else:
+                        screen_x, screen_y = screen_width // 2, screen_height // 2
+                        smoother.reset()
 
             # On camera frame: face mesh + short gaze vectors (no cursor here; cursor on composite)
-            draw_face_mesh_overlay(frame, landmarks, frame_width, frame_height)
-            draw_gaze_vectors(frame, landmarks, frame_width, frame_height, screen_x, screen_y, screen_width, screen_height)
+            draw_face_mesh_overlay(frame_display, landmarks, frame_width, frame_height)
+            draw_gaze_vectors(frame_display, landmarks, frame_width, frame_height, screen_x, screen_y, screen_width, screen_height)
 
             highlighted = hit_test_buttons_display(screen_x, screen_y, button_rects, display_w, display_h, screen_width, screen_height)
             now = time.perf_counter()
@@ -1166,21 +1222,39 @@ def main():
                 dwell_accumulator += dt
                 if dwell_accumulator >= dwell_recal_sec:
                     dwell_accumulator = 0.0
-                    cal_mapper = run_calibration(camera, detector, smoother, screen_width, screen_height,
-                                                 frame_width, frame_height, window_name)
-                    if cal_mapper._matrix is not None:
-                        cal_mapper.save(cal_path)
+                    if use_eyegestures:
+                        gestures.reset(context=context)
+                        if run_calibration_eyegestures(camera, gestures, screen_width, screen_height, window_name):
+                            try:
+                                with open(eg_cal_path, "wb") as f:
+                                    f.write(gestures.saveModel(context=context) or b"")
+                            except Exception:
+                                pass
+                    else:
+                        cal_mapper = run_calibration(camera, detector, smoother, screen_width, screen_height,
+                                                     frame_width, frame_height, window_name)
+                        if cal_mapper._matrix is not None:
+                            cal_mapper.save(cal_path)
             else:
                 dwell_accumulator = 0.0
 
             if recal_click_requested[0]:
                 recal_click_requested[0] = False
-                cal_mapper = run_calibration(camera, detector, smoother, screen_width, screen_height,
-                                             frame_width, frame_height, window_name)
-                if cal_mapper._matrix is not None:
-                    cal_mapper.save(cal_path)
+                if use_eyegestures:
+                    gestures.reset(context=context)
+                    if run_calibration_eyegestures(camera, gestures, screen_width, screen_height, window_name):
+                        try:
+                            with open(eg_cal_path, "wb") as f:
+                                f.write(gestures.saveModel(context=context) or b"")
+                        except Exception:
+                            pass
+                else:
+                    cal_mapper = run_calibration(camera, detector, smoother, screen_width, screen_height,
+                                                 frame_width, frame_height, window_name)
+                    if cal_mapper._matrix is not None:
+                        cal_mapper.save(cal_path)
 
-            draw_composite(composite, frame, camera_rect, button_rects, highlighted,
+            draw_composite(composite, frame_display, camera_rect, button_rects, highlighted,
                           screen_x, screen_y, screen_width, screen_height)
             if now < blink_message_until:
                 dw, dh = composite.shape[1], composite.shape[0]
@@ -1198,7 +1272,7 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             if _is_exit_key(key):
                 break
-            if key == ord("r"):
+            if key == ord("r") and smoother is not None:
                 smoother.reset()
     finally:
         camera.release()

@@ -57,6 +57,13 @@ GAZE_SWAP_XY = False
 USE_HEAD_POSE_CORRECTION = True
 
 # -----------------------------------------------------------------------------
+# Optional: EyeGestures ML-based gaze (better precision, requires eyeGestures + scikit-learn)
+# -----------------------------------------------------------------------------
+USE_EYEGESTURES = True   # If True, use EyeGestures_v3 (Ridge/Lasso) instead of iris-offset + affine
+EYEGESTURES_CALIBRATION_RADIUS = 1000  # Acceptance radius for calibration dots (EyeGestures default 1000)
+EYEGESTURES_CONTEXT = "main"           # Context key for save/load
+
+# -----------------------------------------------------------------------------
 # Blink detection (Eye Aspect Ratio)
 # -----------------------------------------------------------------------------
 BLINK_EAR_THRESHOLD = 0.22       # EAR below this = eye closed; tune if too sensitive/insensitive
@@ -73,6 +80,8 @@ CALIBRATION_GRID_MARGIN = 0.05  # Outer points at 5% and 95%; center at 50%. Cov
 CALIBRATION_DOT_TRANSITION_SEC = 1.2  # Time for dot to move between points
 CALIBRATION_SAMPLES_PER_POINT = 28   # More samples = more stable fit; center uses these for "neutral"
 CALIBRATION_POINT_DURATION_MS = 1500  # Time to look at each point once arrived
+# Set False to skip head-movement phase and see estimation with 16-point only (no head correction)
+RUN_HEAD_CALIBRATION = False
 # Head-movement calibration (after 16 points): right→center, left→center, down→center, up→center
 HEAD_CALIBRATION_GUIDE_DURATION_SEC = 2.0   # Time to show arrow/smooth guide before dot appears
 HEAD_CALIBRATION_SAMPLES_PER_POSITION = 20  # Samples at edge and at center per direction
