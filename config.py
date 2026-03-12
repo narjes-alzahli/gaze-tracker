@@ -59,7 +59,7 @@ USE_HEAD_POSE_CORRECTION = True
 # -----------------------------------------------------------------------------
 # Optional: EyeGestures ML-based gaze (better precision, requires eyeGestures + scikit-learn)
 # -----------------------------------------------------------------------------
-USE_EYEGESTURES = True   # If True, use EyeGestures_v3 (Ridge/Lasso) instead of iris-offset + affine
+USE_EYEGESTURES = False  # If True, use EyeGestures_v3; or run with --gestures to enable from CLI
 EYEGESTURES_CALIBRATION_RADIUS = 1000  # Acceptance radius for calibration dots (EyeGestures default 1000)
 EYEGESTURES_CONTEXT = "main"           # Context key for save/load
 
