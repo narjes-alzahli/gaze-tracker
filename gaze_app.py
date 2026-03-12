@@ -1077,7 +1077,7 @@ def run_calibration_eyegestures(camera, gestures, screen_width, screen_height, w
 # -----------------------------------------------------------------------------
 
 
-def main():
+def main(use_gestures=False):
     # Screen size (for mapping gaze to screen and for calibration)
     screen_width, screen_height = pyautogui.size()
 
@@ -1087,7 +1087,7 @@ def main():
     frame_width = int(camera._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(camera._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    use_eyegestures = getattr(config, "USE_EYEGESTURES", False) and _EYEGESTURES_AVAILABLE
+    use_eyegestures = (getattr(config, "USE_EYEGESTURES", False) or use_gestures) and _EYEGESTURES_AVAILABLE
     gestures = None
     if use_eyegestures:
         try:
@@ -1281,4 +1281,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    p = argparse.ArgumentParser(description="Gaze tracker")
+    p.add_argument("--gestures", action="store_true", help="Use EyeGestures ML-based gaze")
+    args = p.parse_args()
+    main(use_gestures=args.gestures)
